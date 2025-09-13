@@ -1,21 +1,42 @@
 #!/bin/bash
-for originalmp3file in *.mp3; do
-  echo "splitting: $originalmp3file"
-  mp3filename=${originalmp3file::-4}
-  mkdir mp3filename
-  ffmpeg -i ./"$originalmp3file" -f segment -segment_time 600 -c copy "split/$mp3filename"%03d.mp3
-  # shellcheck disable=SC2164
+
+# Loop over all audio files in the directory
+for originalfile in *.mp3 *.m4a *.aac; do
+  # Skip if no files match the pattern
+  [ -e "$originalfile" ] || continue
+
+  echo "Processing: $originalfile"
+
+  # Extract base name without extension
+  basefilename=$(basename "$originalfile")
+  filename_noext="${basefilename%.*}"
+
+  # Create a dedicated output folder
+  outdir="split/${filename_noext}"
+  mkdir -p "$outdir"
+
+  # If input is mp3, we can copy without re-encoding
+  if [[ "$originalfile" == *.mp3 ]]; then
+    codec="-c copy"
+  else
+    # Convert to mp3 if aac/m4a
+    codec="-c:a libmp3lame -q:a 2"
+  fi
+
+  # Split into 10-minute chunks
+  ffmpeg -i "$originalfile" -f segment -segment_time 600 $codec \
+    "${outdir}/${filename_noext}_%03d.mp3"
+
+  # Process ID3 tags for each track
   (
-    cd mp3filename || exit
-    pwd
-    ls
-    for track in *.mp3 ; do
-        track_num=${track:${#track}-7:3}
-        echo "Track ${track}"
-        echo "Track num $track_num"
-        id3tag --song="${track}" --track="$track_num" --album="${originalmp3file}" "${track}"
+    cd "$outdir" || exit
+    for track in *.mp3; do
+      track_num=${track: -7:3}
+      echo "Tagging track: $track (Track $track_num)"
+      id3tag --song="${track}" --track="$track_num" --album="${basefilename}" "${track}"
     done
   )
 done
 
-echo "files split"
+echo "All files processed and split."
+
