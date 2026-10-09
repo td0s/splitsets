@@ -1,5 +1,16 @@
 #!/bin/bash
 
+# Make sure the tools we rely on are installed
+for cmd in curl ffmpeg id3tag; do
+  if ! command -v "$cmd" >/dev/null; then
+    echo "Error: '$cmd' is not installed." >&2
+    exit 1
+  fi
+done
+
+# Globs with no matches expand to nothing, and regex/case matches ignore case
+shopt -s nullglob nocaseglob nocasematch
+
 # Check if a comma-separated list of URLs was passed as the first argument
 if [[ -n "$1" ]]; then
   echo "Downloading files from provided URLs..."
@@ -9,13 +20,29 @@ if [[ -n "$1" ]]; then
 
   for url in "${URLS[@]}"; do
     # Trim any leading/trailing whitespace around the URL
-    url=$(echo "$url" | xargs)
+    url="${url#"${url%%[![:space:]]*}"}"
+    url="${url%"${url##*[![:space:]]}"}"
 
     # Skip empty strings
     [[ -z "$url" ]] && continue
 
+    # Name the file after the last part of the URL path, without any query
+    # string, with percent-encoding decoded and no slashes left in it
+    outname="${url%%[?#]*}"
+    outname="${outname##*/}"
+    printf -v outname '%b' "${outname//%/\\x}"
+    outname="${outname//\//_}"
+
+    if [[ -z "$outname" ]]; then
+      echo "Skipping (no filename in URL): $url" >&2
+      continue
+    fi
+
     echo "Downloading: $url"
-    curl -L -O "$url"
+    if ! curl -fL -o "$outname" "$url"; then
+      echo "Download failed: $url" >&2
+      rm -f "$outname"
+    fi
   done
 
   echo "Downloads complete."
@@ -24,114 +51,108 @@ fi
 
 # Loop over all audio files in the directory
 for originalfile in *.mp3 *.m4a *.aac; do
-  # Skip if no files match the pattern
-  [ -e "$originalfile" ] || continue
-
   echo "Processing: $originalfile"
 
-  # Extract base name without extension
-  basefilename=$(basename "$originalfile")
-
-  # Strip the specific prefix from the start of the filename, if it exists
-  basefilename="${basefilename#Kool FM - Kool FM Podcast - }"
-
-  filename_noext="${basefilename%.*}"
+  filename_noext="${originalfile%.*}"
+  extracted_date=""
 
   # 1st Date Check: YYYYMMDD, YYYY-MM-DD, or YYYY_MM_DD
   # Strict bounds: Year (1000-2999), Month (01-12), Day (01-31)
-  if [[ "$filename_noext" =~ ([12][0-9]{3})[-_]?(0[1-9]|1[0-2])[-_]?(0[1-9]|[12][0-9]|3[01]) ]]; then
-    extracted_date="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}"
-    album_name="${extracted_date} - ${basefilename}"
+  if [[ "$filename_noext" =~ (^|[^0-9])([12][0-9]{3})[-_]?(0[1-9]|1[0-2])[-_]?(0[1-9]|[12][0-9]|3[01])([^0-9]|$) ]]; then
+    extracted_date="${BASH_REMATCH[2]}-${BASH_REMATCH[3]}-${BASH_REMATCH[4]}"
+    matched="${BASH_REMATCH[0]}"
 
   # 2nd Date Check: DD-MM-YYYY, D-M-YYYY, DD MMM YYYY, etc.
-  # Captures: Day (1-31), Month (letters OR 01-12), Year (1000-2999)
-  elif [[ "$filename_noext" =~ (0?[1-9]|[12][0-9]|3[01])[[:space:]_-]+([A-Za-z]+|0?[1-9]|1[0-2])[[:space:]_-]+([12][0-9]{3}) ]]; then
-    raw_day="${BASH_REMATCH[1]}"
-    raw_month="${BASH_REMATCH[2]}"
-    year="${BASH_REMATCH[3]}"
+  # Captures: Day (1-31), Month (month name OR 1-12), Year (1000-2999)
+  elif [[ "$filename_noext" =~ (^|[^0-9])(0?[1-9]|[12][0-9]|3[01])[[:space:]_-]+(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sept|sep|october|oct|november|nov|december|dec|0?[1-9]|1[0-2])[[:space:]_-]+([12][0-9]{3})([^0-9]|$) ]]; then
+    raw_day="${BASH_REMATCH[2]}"
+    raw_month="${BASH_REMATCH[3]}"
+    year="${BASH_REMATCH[4]}"
+    matched="${BASH_REMATCH[0]}"
 
     # Pad the day with a leading zero if it's a single digit
     printf -v day "%02d" $((10#$raw_day))
 
-    # Check if the extracted month is purely numeric
-    if [[ "$raw_month" =~ ^[0-9]+$ ]]; then
-      # Pad the numeric month with a leading zero
-      printf -v month "%02d" $((10#$raw_month))
-    else
-      # Convert the text month name to lowercase for matching
-      month_lower=$(echo "$raw_month" | tr '[:upper:]' '[:lower:]')
+    # Map a month name to a two-digit numeric month (matched case-insensitively)
+    case "${raw_month:0:3}" in
+      jan) month="01" ;;
+      feb) month="02" ;;
+      mar) month="03" ;;
+      apr) month="04" ;;
+      may) month="05" ;;
+      jun) month="06" ;;
+      jul) month="07" ;;
+      aug) month="08" ;;
+      sep) month="09" ;;
+      oct) month="10" ;;
+      nov) month="11" ;;
+      dec) month="12" ;;
+      *)   printf -v month "%02d" $((10#$raw_month)) ;;
+    esac
 
-      # Map the word month to a two-digit numeric month
-      case "$month_lower" in
-        jan|january)   month="01" ;;
-        feb|february)  month="02" ;;
-        mar|march)     month="03" ;;
-        apr|april)     month="04" ;;
-        may)           month="05" ;;
-        jun|june)      month="06" ;;
-        jul|july)      month="07" ;;
-        aug|august)    month="08" ;;
-        sep|september) month="09" ;;
-        oct|october)   month="10" ;;
-        nov|november)  month="11" ;;
-        dec|december)  month="12" ;;
-        *)             month="" ;; # Fallback if word isn't a real month
-      esac
-    fi
+    extracted_date="${year}-${month}-${day}"
 
-    # Apply the prefix only if a valid month was found
-    if [[ -n "$month" ]]; then
-      extracted_date="${year}-${month}-${day}"
-      album_name="${extracted_date} - ${basefilename}"
-    else
-      album_name="${basefilename}"
-    fi
-
-  # 3rd Date Check: DDMMYY, DD-MM-YY, or DD_MM_YY
-  # Strict bounds: Day (01-31), Month (01-12), Year (00-99)
-  elif [[ "$filename_noext" =~ (0[1-9]|[12][0-9]|3[01])[-_]?(0[1-9]|1[0-2])[-_]?([0-9]{2}) ]]; then
-    day="${BASH_REMATCH[1]}"
-    month="${BASH_REMATCH[2]}"
-    short_year="${BASH_REMATCH[3]}"
+  # 3rd Date Check: DDMMYYYY, DDMMYY, DD-MM-YY, DD_MM_YY, etc.
+  # Strict bounds: Day (01-31), Month (01-12), Year (1000-2999 or 00-99)
+  elif [[ "$filename_noext" =~ (^|[^0-9])(0[1-9]|[12][0-9]|3[01])[-_]?(0[1-9]|1[0-2])[-_]?([12][0-9]{3}|[0-9]{2})([^0-9]|$) ]]; then
+    day="${BASH_REMATCH[2]}"
+    month="${BASH_REMATCH[3]}"
+    year="${BASH_REMATCH[4]}"
+    matched="${BASH_REMATCH[0]}"
 
     # Convert 2-digit year to 4-digit year safely
-    if (( 10#$short_year < 50 )); then
-      year="20${short_year}"
-    else
-      year="19${short_year}"
+    if (( ${#year} == 2 )); then
+      if (( 10#$year < 50 )); then
+        year="20${year}"
+      else
+        year="19${year}"
+      fi
     fi
 
     extracted_date="${year}-${month}-${day}"
-    album_name="${extracted_date} - ${basefilename}"
-
-  else
-    # Fallback to just the base filename if no date pattern is found
-    album_name="${basefilename}"
   fi
 
-  # Create a dedicated output folder based on the cleaned filename
+  # Album is "date - name", or just the date if the name is nothing but the date
+  if [[ -z "$extracted_date" ]]; then
+    album_name="${filename_noext}"
+  elif [[ "${filename_noext/"$matched"/}" =~ [[:alnum:]] ]]; then
+    album_name="${extracted_date} - ${filename_noext}"
+  else
+    album_name="${extracted_date}"
+  fi
+
+  # Create a dedicated output folder based on the filename. If it already
+  # exists, this file was split before (or shares its name with another file)
   outdir="split/${filename_noext}"
+  if [[ -e "$outdir" ]]; then
+    echo "Skipping: $outdir already exists (delete it to split again)"
+    continue
+  fi
   mkdir -p "$outdir"
 
   # If input is mp3, we can copy without re-encoding
   if [[ "$originalfile" == *.mp3 ]]; then
-    codec="-c copy"
+    codec=(-c copy)
   else
     # Convert to mp3 if aac/m4a
-    codec="-c:a libmp3lame -q:a 2"
+    codec=(-c:a libmp3lame -q:a 2)
   fi
 
-  # Split into 10-minute chunks
-  ffmpeg -i "$originalfile" -f segment -segment_time 600 $codec \
-    "${outdir}/${filename_noext}_%03d.mp3"
+  # Split the audio (ignoring any cover art) into 10-minute chunks numbered from 1
+  if ! ffmpeg -nostdin -i "$originalfile" -map 0:a -f segment -segment_time 600 \
+      -segment_start_number 1 "${codec[@]}" "${outdir}/${filename_noext//%/%%}_%03d.mp3"; then
+    echo "ffmpeg failed on: $originalfile" >&2
+    rm -rf "$outdir"
+    continue
+  fi
 
   # Process ID3 tags for each track
   (
     cd "$outdir" || exit
     for track in *.mp3; do
-      track_num=${track: -7:3}
+      track_num=$((10#${track: -7:3}))
       echo "Tagging track: $track (Track $track_num)"
-      id3tag --song="${track}" --track="$track_num" --album="${album_name}" "${track}"
+      id3tag --song="${track%.mp3}" --track="$track_num" --album="${album_name}" "${track}"
     done
   )
 done
